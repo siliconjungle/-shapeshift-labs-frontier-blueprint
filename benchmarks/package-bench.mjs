@@ -30,6 +30,7 @@ const input = makeCatalogInput(blueprintCount, instanceCount);
 let catalog = createBlueprintCatalog(input);
 let compiled = compileBlueprintCatalog(catalog);
 let projection = compileBlueprintProjection(compiled, undefined, { targetPath: '/entities' });
+let projectionWithMaterializations = compileBlueprintProjection(compiled, undefined, { targetPath: '/entities', includeMaterializations: true });
 let materialization = materializeBlueprintInstance(compiled, catalog.instances[0]);
 let edit = compileBlueprintOverridePatch(compiled, catalog.instances[0], [[0, ['hp'], 1]], {
   instancePath: '/blueprintInstances/' + catalog.instances[0].id,
@@ -55,6 +56,10 @@ const rows = [
   measure('projection-patch-' + instanceCount, 2, () => {
     projection = compileBlueprintProjection(compiled, undefined, { targetPath: '/entities' });
     return projection.patch.length;
+  }),
+  measure('projection-materializations-' + instanceCount, 2, () => {
+    projectionWithMaterializations = compileBlueprintProjection(compiled, undefined, { targetPath: '/entities', includeMaterializations: true });
+    return projectionWithMaterializations.materializations.length;
   }),
   measure('override-compile', 64, () => {
     const instance = catalog.instances[cursor++ % catalog.instances.length];

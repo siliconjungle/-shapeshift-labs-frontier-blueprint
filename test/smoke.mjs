@@ -47,6 +47,17 @@ const enemy = createBlueprint({
         '/sprite': 'slime-elite',
         '/loot/coin': 8
       }
+    },
+    armored: {
+      extends: 'elite',
+      params: { armor: 4 },
+      additions: {
+        '/armor': 4,
+        '/resistances/0': 'physical'
+      },
+      overrides: {
+        '/loot/coin': 12
+      }
     }
   },
   resources: ['sprite:slime'],
@@ -57,7 +68,7 @@ const enemy = createBlueprint({
 const instance = createBlueprintInstance({
   id: 'enemy-42',
   blueprint: enemy,
-  variant: 'elite',
+  variant: 'armored',
   params: { x: 12, y: 4 },
   overrides: { '/hp': 35 },
   removals: ['/loot/rareDrop'],
@@ -79,7 +90,9 @@ const materialized = materializeBlueprintInstance(compiled, instance, { includeI
 assert.strictEqual(materialized.value.id, 'enemy-42');
 assert.strictEqual(materialized.value.hp, 35);
 assert.strictEqual(materialized.value.sprite, 'slime-elite');
-assert.strictEqual(materialized.value.loot.coin, 8);
+assert.strictEqual(materialized.value.loot.coin, 12);
+assert.strictEqual(materialized.value.armor, 4);
+assert.deepStrictEqual(materialized.value.resistances, ['physical']);
 assert.strictEqual(Object.prototype.hasOwnProperty.call(materialized.value.loot, 'rareDrop'), false);
 assert.strictEqual(materialized.value.scene.id, 'scene-node-42');
 assert.strictEqual(materialized.value.scene.local.x, 12);

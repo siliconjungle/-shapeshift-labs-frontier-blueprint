@@ -282,6 +282,21 @@ export interface FrontierBlueprintProof {
 type BlueprintLike = FrontierBlueprint | FrontierBlueprintInput | FrontierCompiledBlueprintCatalog | FrontierBlueprintCatalog;
 
 const hasOwn = Object.prototype.hasOwnProperty;
+const EMPTY_VARIANT_CHAIN: readonly FrontierBlueprintVariant[] = Object.freeze([]);
+const MAX_POINTER_PATH_CACHE_SIZE = 4096;
+const blueprintLocalIdsCache = new WeakMap<FrontierBlueprint, readonly string[]>();
+const blueprintVariantChainCache = new WeakMap<FrontierBlueprint, Map<string, readonly FrontierBlueprintVariant[]>>();
+const blueprintPointerPathCache = new Map<string, JsonPath>();
+
+interface ResolvedBlueprintValue {
+  blueprint: FrontierBlueprint;
+  instance: FrontierBlueprintInstance;
+  value: JsonValue;
+  idMap: Record<string, string>;
+  overridePaths: string[];
+  additionPaths: string[];
+  removalPaths: string[];
+}
 
 export function defineBlueprint(input: FrontierBlueprintInput): FrontierBlueprint {
   return createBlueprint(input);
@@ -447,52 +462,20 @@ export function materializeBlueprintInstance(
   instanceInput: FrontierBlueprintInstance | FrontierBlueprintInstanceInput,
   options: FrontierBlueprintMaterializeOptions = {}
 ): FrontierBlueprintMaterialization {
-  const instance = isBlueprintInstance(instanceInput) ? instanceInput : createBlueprintInstance(instanceInput);
-  const blueprint = resolveBlueprint(blueprintOrCatalog, instance.blueprintId);
-  const idMap = createIdMap(blueprint, instance, options);
-  const params = mergeParams(blueprint, instance, options);
-  let value = substituteBlueprintValue(blueprint.template, { blueprint, instance, params, idMap, options });
-
-  const chain = variantChain(blueprint, instance.variant);
-  const overridePaths: string[] = [];
-  const additionPaths: string[] = [];
-  const removalPaths: string[] = [];
-
-  for (const variant of chain) {
-    value = applyOverlay(value, variant.removals, variant.additions, variant.overrides);
-    removalPaths.push(...variant.removals);
-    additionPaths.push(...Object.keys(variant.additions));
-    overridePaths.push(...Object.keys(variant.overrides));
-  }
-  value = applyOverlay(value, instance.removals, instance.additions, instance.overrides);
-  removalPaths.push(...instance.removals);
-  additionPaths.push(...Object.keys(instance.additions));
-  overridePaths.push(...Object.keys(instance.overrides));
-
-  if (options.includeInstanceMetadata && isPlainObject(value)) {
-    value = {
-      ...value,
-      $blueprint: {
-        id: blueprint.id,
-        version: blueprint.version ?? null,
-        instance: instance.id,
-        variant: instance.variant ?? null
-      }
-    };
-  }
+  const materialized = materializeBlueprintValue(blueprintOrCatalog, instanceInput, options, true);
 
   return {
     kind: FRONTIER_BLUEPRINT_MATERIALIZATION_KIND,
     version: FRONTIER_BLUEPRINT_MATERIALIZATION_VERSION,
-    blueprintId: blueprint.id,
-    instanceId: instance.id,
-    variant: instance.variant,
-    value,
-    inheritedPaths: collectInheritedPaths(value, new Set([...overridePaths, ...additionPaths, ...removalPaths])),
-    overridePaths: uniqueStrings(overridePaths).sort(),
-    additionPaths: uniqueStrings(additionPaths).sort(),
-    removalPaths: uniqueStrings(removalPaths).sort(),
-    idMap
+    blueprintId: materialized.blueprint.id,
+    instanceId: materialized.instance.id,
+    variant: materialized.instance.variant,
+    value: materialized.value,
+    inheritedPaths: collectInheritedPaths(materialized.value, new Set([...materialized.overridePaths, ...materialized.additionPaths, ...materialized.removalPaths])),
+    overridePaths: uniqueStrings(materialized.overridePaths).sort(),
+    additionPaths: uniqueStrings(materialized.additionPaths).sort(),
+    removalPaths: uniqueStrings(materialized.removalPaths).sort(),
+    idMap: materialized.idMap
   };
 }
 
@@ -521,10 +504,16 @@ export function compileBlueprintProjection(
   const valuesById: Record<string, JsonValue> = {};
   const materializations: FrontierBlueprintMaterialization[] = [];
   for (const instance of instances) {
-    const materialization = materializeBlueprintInstance(compiled, instance);
-    valuesById[instance.id] = cloneJson(materialization.value);
-    patch.push([OP_SET, targetPath.concat(instance.id), cloneJson(materialization.value)]);
-    if (options.includeMaterializations) materializations.push(materialization);
+    if (options.includeMaterializations) {
+      const materialization = materializeBlueprintInstance(compiled, instance);
+      valuesById[instance.id] = cloneJson(materialization.value);
+      patch.push([OP_SET, targetPath.concat(instance.id), cloneJson(materialization.value)]);
+      materializations.push(materialization);
+    } else {
+      const materialized = materializeBlueprintValue(compiled, instance, {}, false);
+      valuesById[instance.id] = materialized.value;
+      patch.push([OP_SET, targetPath.concat(instance.id), cloneJson(materialized.value)]);
+    }
   }
   const out: FrontierBlueprintProjection = {
     kind: FRONTIER_BLUEPRINT_PROJECTION_KIND,
@@ -544,7 +533,7 @@ export function compileBlueprintOverridePatch(
   options: FrontierBlueprintOverridePatchOptions
 ): FrontierBlueprintOverridePatchResult {
   const instance = isBlueprintInstance(instanceInput) ? cloneInstance(instanceInput) : createBlueprintInstance(instanceInput);
-  const current = materializeBlueprintInstance(blueprintOrCatalog, instance).value;
+  const current = materializeBlueprintValue(blueprintOrCatalog, instance, {}, false).value;
   const next = applyPatch(cloneJson(current), effectivePatch);
   const sourcePatch: Patch = [];
   const instancePath = normalizeTargetPath(options.instancePath);
@@ -799,13 +788,63 @@ function summarizeBlueprintCatalog(blueprints: readonly FrontierBlueprint[], ins
   };
 }
 
-function mergeParams(blueprint: FrontierBlueprint, instance: FrontierBlueprintInstance, options: FrontierBlueprintMaterializeOptions): JsonObject {
-  const params = cloneObject(blueprint.params);
-  for (const variant of variantChain(blueprint, instance.variant)) {
-    Object.assign(params, cloneObject(variant.params));
+function materializeBlueprintValue(
+  blueprintOrCatalog: BlueprintLike,
+  instanceInput: FrontierBlueprintInstance | FrontierBlueprintInstanceInput,
+  options: FrontierBlueprintMaterializeOptions,
+  collectPaths: boolean
+): ResolvedBlueprintValue {
+  const instance = isBlueprintInstance(instanceInput) ? instanceInput : createBlueprintInstance(instanceInput);
+  const blueprint = resolveBlueprint(blueprintOrCatalog, instance.blueprintId);
+  const chain = variantChain(blueprint, instance.variant);
+  const idMap = createIdMap(blueprint, instance, options);
+  const params = mergeParams(blueprint, instance, options, chain);
+  let value = substituteBlueprintValue(blueprint.template, { blueprint, instance, params, idMap, options });
+  const overridePaths: string[] = [];
+  const additionPaths: string[] = [];
+  const removalPaths: string[] = [];
+
+  for (const variant of chain) {
+    value = applyOverlay(value, variant.removals, variant.additions, variant.overrides);
+    if (collectPaths) {
+      removalPaths.push(...variant.removals);
+      additionPaths.push(...Object.keys(variant.additions));
+      overridePaths.push(...Object.keys(variant.overrides));
+    }
   }
-  Object.assign(params, cloneObject(instance.params));
-  Object.assign(params, cloneObject(options.params));
+
+  value = applyOverlay(value, instance.removals, instance.additions, instance.overrides);
+  if (collectPaths) {
+    removalPaths.push(...instance.removals);
+    additionPaths.push(...Object.keys(instance.additions));
+    overridePaths.push(...Object.keys(instance.overrides));
+  }
+
+  if (options.includeInstanceMetadata && isPlainObject(value)) {
+    value = {
+      ...value,
+      $blueprint: {
+        id: blueprint.id,
+        version: blueprint.version ?? null,
+        instance: instance.id,
+        variant: instance.variant ?? null
+      }
+    };
+  }
+
+  return { blueprint, instance, value, idMap, overridePaths, additionPaths, removalPaths };
+}
+
+function mergeParams(
+  blueprint: FrontierBlueprint,
+  instance: FrontierBlueprintInstance,
+  options: FrontierBlueprintMaterializeOptions,
+  chain: readonly FrontierBlueprintVariant[]
+): JsonObject {
+  const params: JsonObject = { ...blueprint.params };
+  for (const variant of chain) Object.assign(params, variant.params);
+  Object.assign(params, instance.params);
+  if (options.params) Object.assign(params, options.params);
   return params;
 }
 
@@ -813,10 +852,18 @@ function createIdMap(blueprint: FrontierBlueprint, instance: FrontierBlueprintIn
   const idMap: Record<string, string> = {};
   const separator = options.idSeparator ?? ':';
   const merged = { ...instance.idMap, ...(options.idMap ?? {}) };
-  const localIds = collectLocalIds(blueprint.template);
+  const localIds = blueprintLocalIds(blueprint);
   for (const localId of localIds) idMap[localId] = merged[localId] ?? instance.id + separator + localId;
   for (const [key, value] of Object.entries(merged)) idMap[key] = value;
   return idMap;
+}
+
+function blueprintLocalIds(blueprint: FrontierBlueprint): readonly string[] {
+  const cached = blueprintLocalIdsCache.get(blueprint);
+  if (cached) return cached;
+  const localIds = Array.from(collectLocalIds(blueprint.template));
+  blueprintLocalIdsCache.set(blueprint, localIds);
+  return localIds;
 }
 
 function collectLocalIds(value: JsonValue, ids = new Set<string>()): Set<string> {
@@ -882,8 +929,15 @@ function readParam(params: JsonObject, key: string, fallback: JsonValue): JsonVa
   return hasOwn.call(params, key) ? params[key] : fallback;
 }
 
-function variantChain(blueprint: FrontierBlueprint, variantId?: string): FrontierBlueprintVariant[] {
-  if (!variantId) return [];
+function variantChain(blueprint: FrontierBlueprint, variantId?: string): readonly FrontierBlueprintVariant[] {
+  if (!variantId) return EMPTY_VARIANT_CHAIN;
+  let chains = blueprintVariantChainCache.get(blueprint);
+  if (!chains) {
+    chains = new Map<string, readonly FrontierBlueprintVariant[]>();
+    blueprintVariantChainCache.set(blueprint, chains);
+  }
+  const cached = chains.get(variantId);
+  if (cached) return cached;
   const out: FrontierBlueprintVariant[] = [];
   const seen = new Set<string>();
   let current: string | undefined = variantId;
@@ -895,6 +949,7 @@ function variantChain(blueprint: FrontierBlueprint, variantId?: string): Frontie
     out.unshift(variant);
     current = variant.extends;
   }
+  chains.set(variantId, out);
   return out;
 }
 
@@ -904,29 +959,29 @@ function applyOverlay(
   additions: FrontierBlueprintOverlay,
   overrides: FrontierBlueprintOverlay
 ): JsonValue {
-  let value = cloneJson(source);
-  for (const pointer of removals) value = removeAtPath(value, pointerPath(pointer));
-  for (const [pointer, next] of Object.entries(additions)) value = setAtPath(value, pointerPath(pointer), cloneJson(next));
-  for (const [pointer, next] of Object.entries(overrides)) value = setAtPath(value, pointerPath(pointer), cloneJson(next));
+  let value = source;
+  for (let i = 0; i < removals.length; i++) value = removeAtPath(value, cachedPointerPath(removals[i]));
+  for (const [pointer, next] of Object.entries(additions)) value = setAtPath(value, cachedPointerPath(pointer), cloneJson(next));
+  for (const [pointer, next] of Object.entries(overrides)) value = setAtPath(value, cachedPointerPath(pointer), cloneJson(next));
   return value;
 }
 
 function setAtPath(root: JsonValue, path: JsonPath, value: JsonValue): JsonValue {
   if (path.length === 0) return value;
   let cursor = root;
-  if (!isContainer(cursor)) cursor = typeof path[0] === 'number' ? [] : {};
+  if (!isContainer(cursor)) cursor = isArrayLikePathKey(path[0]) ? [] : {};
   const out = cursor;
   for (let i = 0; i < path.length - 1; i++) {
     const key = path[i];
     const nextKey = path[i + 1];
     if (Array.isArray(cursor)) {
       const index = toArrayIndex(key);
-      if (!isContainer(cursor[index])) cursor[index] = typeof nextKey === 'number' ? [] : {};
+      if (!isContainer(cursor[index])) cursor[index] = isArrayLikePathKey(nextKey) ? [] : {};
       cursor = cursor[index];
     } else if (isPlainObject(cursor)) {
       const object = cursor as JsonObject;
       const prop = String(key);
-      if (!isContainer(object[prop])) object[prop] = typeof nextKey === 'number' ? [] : {};
+      if (!isContainer(object[prop])) object[prop] = isArrayLikePathKey(nextKey) ? [] : {};
       cursor = object[prop];
     }
   }
@@ -987,15 +1042,18 @@ function resolveBlueprint(input: BlueprintLike, id: string): FrontierBlueprint {
   return blueprint;
 }
 
-function collectInheritedPaths(value: JsonValue, hidden: Set<string>, base: JsonPath = [], out: string[] = []): string[] {
-  const pointer = stringifyPointer(base);
+function collectInheritedPaths(value: JsonValue, hidden: Set<string>, pointer = '', out: string[] = []): string[] {
   if (!hidden.has(pointer)) out.push(pointer);
   if (Array.isArray(value)) {
-    for (let i = 0; i < value.length; i++) collectInheritedPaths(value[i], hidden, base.concat(i), out);
+    for (let i = 0; i < value.length; i++) collectInheritedPaths(value[i], hidden, appendPointer(pointer, i), out);
   } else if (isPlainObject(value)) {
-    for (const key of Object.keys(value)) collectInheritedPaths(value[key], hidden, base.concat(key), out);
+    for (const key of Object.keys(value)) collectInheritedPaths(value[key], hidden, appendPointer(pointer, key), out);
   }
   return out;
+}
+
+function appendPointer(base: string, key: string | number): string {
+  return base + '/' + String(key).replace(/~/g, '~0').replace(/\//g, '~1');
 }
 
 function normalizeOverlay(input?: FrontierBlueprintOverlay): FrontierBlueprintOverlay {
@@ -1024,8 +1082,17 @@ function pointerKey(path: string | JsonPath): string {
 }
 
 function pointerPath(pointer: string): JsonPath {
+  return cachedPointerPath(pointer).slice();
+}
+
+function cachedPointerPath(pointer: string): JsonPath {
   if (pointer === '') return [];
-  return parsePointer(pointer);
+  const cached = blueprintPointerPathCache.get(pointer);
+  if (cached) return cached;
+  const path = parsePointer(pointer);
+  if (blueprintPointerPathCache.size >= MAX_POINTER_PATH_CACHE_SIZE) blueprintPointerPathCache.clear();
+  blueprintPointerPathCache.set(pointer, path);
+  return path;
 }
 
 function cloneObject(value?: JsonObject): JsonObject {
@@ -1070,6 +1137,10 @@ function isContainer(value: unknown): value is JsonObject | JsonValue[] {
 
 function toArrayIndex(value: string | number): number {
   return typeof value === 'number' ? value : Number(value);
+}
+
+function isArrayLikePathKey(value: string | number): boolean {
+  return typeof value === 'number' || /^(0|[1-9]\d*)$/.test(value);
 }
 
 function cloneInstance(instance: FrontierBlueprintInstance): FrontierBlueprintInstance {

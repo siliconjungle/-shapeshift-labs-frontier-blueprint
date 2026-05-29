@@ -261,13 +261,15 @@ Current benchmark coverage is Frontier-only and focuses on package-local behavio
 - catalog creation and compilation
 - materializing flyweight instances with params, variants, overlays, and id remaps
 - projection patch emission for app state and scene-friendly maps
+- projection-with-materialization control path for tooling that needs provenance metadata
 - effective edit compilation back into compact overrides
 - validation, registry graph, JSONL, proof, and redaction helpers
 
 Latest local run on Node v26.1.0, darwin arm64, 5,000 instances and 30 rounds:
 
-- `materialize-instance`: 12.13 us median, 16.57 us p95
-- `projection-patch-5000`: 60.92 ms median, 65.00 ms p95
-- `override-compile`: 11.49 us median, 14.91 us p95
-- `published-blueprint-root`: 33.4 KiB reachable JS, 11.4 KiB types
-- `physical-blueprint-root`: 8.26 ms median cold import, 9.91 ms p95
+- `materialize-instance`: 6.58 us median, 7.43 us p95
+- `projection-patch-5000`: 16.55 ms median, 17.38 ms p95
+- `projection-materializations-5000`: 39.68 ms median, 42.09 ms p95
+- `override-compile`: 4.91 us median, 5.77 us p95
+- `published-blueprint-root`: 35.6 KiB reachable JS, 11.4 KiB types
+- `physical-blueprint-root`: 9.18 ms median cold import, 16.80 ms p95

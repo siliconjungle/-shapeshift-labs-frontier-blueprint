@@ -1,5 +1,5 @@
 import assert from 'node:assert';
-import { applyPatch } from '@shapeshift-labs/frontier';
+import { OP_REMOVE, OP_SET, applyPatch, cloneJson } from '@shapeshift-labs/frontier';
 import {
   compileBlueprintCatalog,
   compileBlueprintOverridePatch,
@@ -37,14 +37,20 @@ for (let i = 0; i < cases; i++) {
     assert.ok(!Object.prototype.hasOwnProperty.call(materialized.value.loot, 'secret'));
   }
 
-  const chosen = catalog.instances[nextInt(catalog.instances.length)];
-  const hp = 1 + nextInt(200);
-  const edit = compileBlueprintOverridePatch(compiled, chosen, [[0, ['hp'], hp]], {
-    instancePath: '/blueprintInstances/' + chosen.id,
-    effectivePath: '/entities/' + chosen.id
-  });
-  assert.strictEqual(edit.instance.overrides['/hp'], hp);
-  assert.deepStrictEqual(edit.effectivePatch[0][1], ['entities', chosen.id, 'hp']);
+  let chosen = catalog.instances[nextInt(catalog.instances.length)];
+  for (let step = 0; step < 4; step++) {
+    const before = materializeBlueprintInstance(compiled, chosen).value;
+    const effectivePatch = makeEffectivePatch(step);
+    const edit = compileBlueprintOverridePatch(compiled, chosen, effectivePatch, {
+      instancePath: '/blueprintInstances/' + chosen.id,
+      effectivePath: '/entities/' + chosen.id
+    });
+    const expected = applyPatch(cloneJson(before), effectivePatch);
+    const after = materializeBlueprintInstance(compiled, edit.instance).value;
+    assert.deepStrictEqual(after, expected);
+    assert.deepStrictEqual(edit.effectivePatch[0][1].slice(0, 2), ['entities', chosen.id]);
+    chosen = edit.instance;
+  }
 
   const graph = createBlueprintRegistryGraph(compiled);
   assert.ok(graph.entries.length >= catalog.blueprints.length + catalog.instances.length);
@@ -83,6 +89,12 @@ function makeCatalogInput(index) {
         elite: {
           params: { hp: 50 + i },
           overrides: { '/attack': 10 + i }
+        },
+        armored: {
+          extends: 'elite',
+          params: { armor: 4 + i },
+          additions: { '/resistances/0': 'physical' },
+          overrides: { '/loot/coin': 25 + i }
         }
       },
       resources: ['sprite:enemy-' + i],
@@ -94,9 +106,10 @@ function makeCatalogInput(index) {
     instances.push({
       id: 'enemy-' + index + '-' + i,
       blueprint: 'enemy.type-' + blueprintIndex + '.v1',
-      variant: maybe() ? 'elite' : undefined,
+      variant: maybe() ? (maybe() ? 'armored' : 'elite') : undefined,
       params: { x: nextInt(64), y: nextInt(64), hp: 5 + nextInt(80) },
-      overrides: maybe() ? { '/loot/coin': nextInt(20) } : {},
+      overrides: maybe() ? { '/loot/coin': nextInt(20), '/scene/local/x': nextInt(128) } : {},
+      additions: maybe() ? { '/status/0': 'spawned' } : {},
       removals: ['/loot/secret'],
       idMap: maybe() ? { root: 'node-' + index + '-' + i } : undefined
     });
@@ -106,6 +119,20 @@ function makeCatalogInput(index) {
 
 function maybe() {
   return (next() & 1) === 1;
+}
+
+function makeEffectivePatch(step) {
+  const value = 1 + nextInt(200);
+  switch ((next() + step) % 4) {
+    case 0:
+      return [[OP_SET, ['hp'], value]];
+    case 1:
+      return [[OP_SET, ['scene', 'local', 'x'], value]];
+    case 2:
+      return [[OP_SET, ['status', 0], 'fuzz-' + value]];
+    default:
+      return [[OP_REMOVE, ['loot', 'coin']]];
+  }
 }
 
 function nextInt(max) {
